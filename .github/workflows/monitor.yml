@@ -1,0 +1,27 @@
+name: Kintetsu Kashikiri Monitor
+
+on:
+  schedule:
+    # 5分ごとに自動起動
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # 手動実行用ボタン
+
+jobs:
+  scrape-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run Monitor
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
