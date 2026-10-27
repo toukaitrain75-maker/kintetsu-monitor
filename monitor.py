@@ -7,13 +7,13 @@ from bs4 import BeautifulSoup
 import requests
 
 # ─── Webhook設定 ──────────────────────────────────────
-# ① 速報通知用（検知カードが届くチャンネル）
+# ① 速報通知用
 DISCORD_WEBHOOK_URL = os.environ.get(
     "DISCORD_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1564260115627118712/foCYPCGT9U4WKFiIbpbzOUk61Uj1L_kCgjb7sjK9Sah3ffqWFoGXn6X_JXw6LN5kAZvo",
 )
 
-# ② 運行終了ログ専用（走行まとめが蓄積されるチャンネル）
+# ② 運行終了ログ専用
 DISCORD_LOG_WEBHOOK_URL = os.environ.get(
     "DISCORD_LOG_WEBHOOK_URL",
     "https://discord.com/api/webhooks/1564501173560680510/W3TyjQit7bR4rjcj3x1dnRdQB4xF2M9wRbI6dgVfL2uCQl8NrbCj3nr9UCJF18BHTKCS",
@@ -24,11 +24,9 @@ ENABLE_NIGHT_SLEEP = True  # 夜間休止機能を使うか (True / False)
 NIGHT_START_HOUR = 1  # 休止開始（深夜1時）
 NIGHT_END_HOUR = 5  # 休止終了（早朝5時）
 
-# ★夜間も監視したい日の日付（YYYY-MM-DD形式）をここに追加します
-# ※このリストに含まれる日は深夜1:00〜5:00の間も停止せず監視を続けます
+# ★夜間も監視したい日の日付（YYYY-MM-DD形式）
 OVERNIGHT_ACTIVE_DATES = [
-    # "2026-10-31",  # 例: 終夜運転や夜間貸切がある日
-    # "2026-12-31",  # 例: 大晦日
+    # "2026-10-31",
 ]
 
 # ─── 路線設定 ─────────────────────────────────────────
@@ -69,21 +67,19 @@ active_trains = {}
 
 
 def is_night_sleep_time(now_dt):
-  """夜間休止判定（特定夜間日なら休止をスキップ）"""
+  """夜間休止判定"""
   if not ENABLE_NIGHT_SLEEP:
     return False
 
   today_str = now_dt.strftime("%Y-%m-%d")
-  # 夜間運行指定日の場合は休止しない
   if today_str in OVERNIGHT_ACTIVE_DATES:
     return False
 
-  # 指定した深夜時間帯（例: 1:00〜4:59）なら休止
   return NIGHT_START_HOUR <= now_dt.hour < NIGHT_END_HOUR
 
 
 def get_line_stations(soup):
-  """駅名リストを順番通りに辞書化（1始まり）"""
+  """駅名リスト取得"""
   stations = []
   for tag in soup.find_all(class_="station-name"):
     name = tag.get_text(strip=True).replace("\u3000", "").replace(" ", "")
@@ -93,7 +89,7 @@ def get_line_stations(soup):
 
 
 def resolve_train_location(box, stations_dict, direction="下り"):
-  """列車の親セル番号から駅名または駅間を割り出す（進行方向に応じた矢印付き）"""
+  """進行方向に応じた駅間矢印表記"""
   parent_cell = box.find_parent(
       lambda t: t.get("class")
       and any(c.startswith("cell-") for c in t.get("class"))
@@ -121,6 +117,7 @@ def resolve_train_location(box, stations_dict, direction="下り"):
     st1 = stations_dict.get(st_idx1, f"駅番号{st_idx1}")
     st2 = stations_dict.get(st_idx2, f"駅番号{st_idx2}")
 
+    # 上り・下りで矢印の向きを切り替え
     if direction == "上り":
       location_name = f"{st2} → {st1} 間"
     else:
@@ -130,7 +127,7 @@ def resolve_train_location(box, stations_dict, direction="下り"):
 
 
 def parse_delay_text(box):
-  """公式の train_base.js 仕様に基づく遅延判定（秒換算）"""
+  """遅延判定"""
   delay_tag = box.find("span", class_="delay-time")
   if not delay_tag:
     return "🟢 平常運転"
@@ -152,7 +149,7 @@ def parse_delay_text(box):
 def save_train_log(
     line_name, direction, dest, location_name, delay_text, now_str
 ):
-  """ローカルCSVファイルへ追記"""
+  """ローカルCSV保存"""
   os.makedirs(LOG_DIR, exist_ok=True)
   safe_dest = re.sub(r'[\\/:*?"<>|]', "", dest) if dest else "行先なし"
   jst = timezone(timedelta(hours=9))
@@ -176,7 +173,7 @@ def save_train_log(
 def send_discord_embed(
     line_name, direction, dest, location_name, delay_text, line_code, now_str
 ):
-  """速報用チャンネルへカード形式で通知"""
+  """速報Embed送信"""
   if not DISCORD_WEBHOOK_URL:
     return
 
@@ -209,7 +206,7 @@ def send_discord_embed(
 
 
 def send_finish_log_to_discord(train_info):
-  """ログ専用チャンネルへ全走行ログをテキスト投稿"""
+  """運行終了ログ送信"""
   target_webhook = DISCORD_LOG_WEBHOOK_URL or DISCORD_WEBHOOK_URL
   if not target_webhook:
     return
@@ -259,7 +256,6 @@ def send_finish_log_to_discord(train_info):
 
 
 def scan_once():
-  """全路線の1周スキャン（エラー・アクセス制限保護付き）"""
   jst = timezone(timedelta(hours=9))
   now_str = datetime.now(jst).strftime("%Y/%m/%d %H:%M:%S")
   current_seen_train_ids = set()
@@ -269,15 +265,12 @@ def scan_once():
     try:
       res = requests.get(url, headers=HEADERS, timeout=10)
 
-      # 429: レート制限（短時間にアクセスしすぎた場合の警告）
       if res.status_code == 429:
         print(
             f"⚠️ [{line_name}] レート制限 (429) を検知。BAN防止のため5分間待機します..."
         )
         time.sleep(300)
         return False
-
-      # 5xx: 近鉄側のサーバーエラー / メンテナンス
       elif res.status_code >= 500:
         print(
             f"⚠️ [{line_name}] サーバーエラー ({res.status_code})"
@@ -285,9 +278,7 @@ def scan_once():
         )
         time.sleep(120)
         continue
-
       elif res.status_code != 200:
-        print(f"[{line_name}] 応答コード: {res.status_code} (スキップ)")
         time.sleep(1)
         continue
 
@@ -315,6 +306,7 @@ def scan_once():
     )
 
     for box in train_boxes:
+      # 方向判定修正箇所
       direction = "上り" if "train-info-down" in box.get("class", []) else "下り"
       dest_tag = box.find("div", class_="train-destination-text")
       destination = dest_tag.get_text(strip=True) if dest_tag else ""
@@ -410,15 +402,13 @@ if __name__ == "__main__":
   while True:
     now_dt = datetime.now(jst)
 
-    # 1. 夜間休止の判定（指定日以外かつ深夜1:00〜5:00の場合）
     if is_night_sleep_time(now_dt):
       print(
           f"[{now_dt.strftime('%H:%M:%S')}] 🌙 夜間休止時間帯（{NIGHT_START_HOUR}:00〜{NIGHT_END_HOUR}:00）です。15分待機します。"
       )
-      time.sleep(900)  # 15分待機して再確認
+      time.sleep(900)
       continue
 
-    # 2. 通常の監視スキャン
     print(f"\n[{now_dt.strftime('%H:%M:%S')}] 監視スキャン実施 (#{count})")
     has_kashikiri = scan_once()
     count += 1
