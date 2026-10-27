@@ -1,34 +1,45 @@
+import csv
+from datetime import datetime, timedelta, timezone
 import os
 import re
 import time
-import requests
 from bs4 import BeautifulSoup
+import requests
 
-# GitHub SecretsからURLを読み込み
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# ① 速報通知用（検知カードが届くチャンネル）
+DISCORD_WEBHOOK_URL = os.environ.get(
+    "DISCORD_WEBHOOK_URL",
+    "https://discord.com/api/webhooks/1564260115627118712/foCYPCGT9U4WKFiIbpbzOUk61Uj1L_kCgjb7sjK9Sah3ffqWFoGXn6X_JXw6LN5kAZvo",
+)
 
-# 近鉄 全20路線 完全対応
+# ② 運行終了ログ専用（走行まとめが蓄積されるチャンネル）
+DISCORD_LOG_WEBHOOK_URL = os.environ.get(
+    "DISCORD_LOG_WEBHOOK_URL",
+    "https://discord.com/api/webhooks/1564501173560680510/W3TyjQit7bR4rjcj3x1dnRdQB4xF2M9wRbI6dgVfL2uCQl8NrbCj3nr9UCJF18BHTKCS",
+)
+
+# 監視対象の9路線
 TARGET_LINES = {
     "01": "難波線・奈良線",
-    "02": "生駒線",
+    # "02": "生駒線",
     "03": "京都線",
     "04": "橿原線",
     "05": "天理線",
-    "06": "田原本線",
+    # "06": "田原本線",
     "07": "大阪線（大阪上本町〜西青山）",
     "08": "大阪線（東青山〜伊勢中川）",
-    "09": "信貴線",
+    # "09": "信貴線",
     "10": "名古屋線",
-    "11": "湯の山線",
-    "12": "鈴鹿線",
+    # "11": "湯の山線",
+    # "12": "鈴鹿線",
     "13": "山田線",
     "14": "鳥羽線",
     "15": "志摩線",
-    "16": "南大阪線",
-    "17": "吉野線",
-    "18": "道明寺線",
-    "19": "長野線",
-    "20": "御所線",
+    # "16": "南大阪線",
+    # "17": "吉野線",
+    # "18": "道明寺線",
+    # "19": "長野線",
+    # "20": "御所線",
 }
 
 BASE_URL = "https://tid.kintetsu.co.jp/LocationWeb/trainlocationinfoweb{}.html"
@@ -39,10 +50,18 @@ HEADERS = {
     )
 }
 
+# ローカルCSV保存フォルダ
+LOG_DIR = "logs"
+
+# 重複通知防止用の記憶セット
 notified_trains = set()
+
+# 追跡中のアクティブ列車を管理する辞書
+active_trains = {}
 
 
 def get_line_stations(soup):
+  """駅名リストを順番通りに辞書化（1始まり）"""
   stations = []
   for tag in soup.find_all(class_="station-name"):
     name = tag.get_text(strip=True).replace("\u3000", "").replace(" ", "")
@@ -51,7 +70,8 @@ def get_line_stations(soup):
   return {i + 1: name for i, name in enumerate(stations)}
 
 
-def resolve_train_location(box, stations_dict):
+def resolve_train_location(box, stations_dict, direction="下り"):
+  """列車の親セル番号から駅名または駅間を割り出す（進行方向に応じた矢印付き）"""
   parent_cell = box.find_parent(
       lambda t: t.get("class")
       and any(c.startswith("cell-") for c in t.get("class"))
@@ -70,20 +90,28 @@ def resolve_train_location(box, stations_dict):
   if cell_num is None:
     return "位置不明", None
 
+  # 奇数セル：駅ホーム
   if cell_num % 2 == 1:
     st_idx = (cell_num + 1) // 2
     location_name = stations_dict.get(st_idx, f"駅番号{st_idx}")
+  # 偶数セル：駅間走行中
   else:
     st_idx1 = cell_num // 2
     st_idx2 = st_idx1 + 1
     st1 = stations_dict.get(st_idx1, f"駅番号{st_idx1}")
     st2 = stations_dict.get(st_idx2, f"駅番号{st_idx2}")
-    location_name = f"{st1} 〜 {st2} 間"
+
+    # 進行方向に応じて矢印の向きを決定
+    if direction == "上り":
+      location_name = f"{st2} → {st1} 間"
+    else:
+      location_name = f"{st1} → {st2} 間"
 
   return location_name, cell_num
 
 
 def parse_delay_text(box):
+  """公式の train_base.js 仕様に基づく遅延判定（秒換算）"""
   delay_tag = box.find("span", class_="delay-time")
   if not delay_tag:
     return "🟢 平常運転"
@@ -102,15 +130,38 @@ def parse_delay_text(box):
     return "🚨 大幅遅れ"
 
 
-def send_discord_embed(
-    line_name, direction, dest, location_name, delay_text, line_code
+def save_train_log(
+    line_name, direction, dest, location_name, delay_text, now_str
 ):
+  """ローカルCSVファイルへバックアップ追記"""
+  os.makedirs(LOG_DIR, exist_ok=True)
+  safe_dest = re.sub(r'[\\/:*?"<>|]', "", dest) if dest else "行先なし"
+  jst = timezone(timedelta(hours=9))
+  date_str = datetime.now(jst).strftime("%Y%m%d")
+  filename = os.path.join(
+      LOG_DIR, f"{date_str}_{line_name}_{direction}_{safe_dest}.csv"
+  )
+  file_exists = os.path.exists(filename)
+
+  with open(filename, mode="a", encoding="utf-8-sig", newline="") as f:
+    writer = csv.writer(f)
+    if not file_exists:
+      writer.writerow(
+          ["検知日時", "路線", "進行方向", "行先", "現在位置", "運行状況"]
+      )
+    writer.writerow(
+        [now_str, line_name, direction, dest, location_name, delay_text]
+    )
+
+
+def send_discord_embed(
+    line_name, direction, dest, location_name, delay_text, line_code, now_str
+):
+  """速報用チャンネルへカード形式で通知"""
   if not DISCORD_WEBHOOK_URL:
     return
 
   web_url = BASE_URL.format(line_code)
-  now_str = time.strftime("%Y/%m/%d %H:%M:%S")
-
   payload = {
       "content": "🚨 **貸切列車を検知しました！** @everyone",
       "embeds": [{
@@ -132,22 +183,79 @@ def send_discord_embed(
           "footer": {"text": "タップすると近鉄公式の走行位置画面を開きます"},
       }],
   }
-
   try:
     requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
   except Exception as e:
-    print(f"Discord送信エラー: {e}")
+    print(f"速報通知送信エラー: {e}")
+
+
+def send_finish_log_to_discord(train_info):
+  """ログ専用チャンネルへ全走行ログをテキスト貼り付け投稿"""
+  target_webhook = DISCORD_LOG_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+  if not target_webhook:
+    return
+
+  line_name = train_info["line_name"]
+  direction = train_info["direction"]
+  dest = train_info["dest"]
+  history = train_info["history"]
+
+  if not history:
+    return
+
+  start_time = history[0]["time"]
+  end_time = history[-1]["time"]
+  start_loc = history[0]["location"]
+  end_loc = history[-1]["location"]
+
+  lines = [f"{h['time']} | {h['location']} ({h['delay']})" for h in history]
+  log_body = "\n".join(lines)
+
+  header = (
+      f"🏁 **【運行終了】貸切列車の追跡ログ ({line_name})**\n"
+      f"・**方向**: {direction}\n"
+      f"・**行先**: {dest if dest else 'なし'}\n"
+      f"・**走行区間**: {start_loc} ➔ {end_loc}\n"
+      f"・**追跡期間**: {start_time} 〜 {end_time}\n"
+      f"```text\n"
+  )
+  footer = "\n```"
+
+  max_body_len = 2000 - len(header) - len(footer) - 20
+  if len(log_body) > max_body_len:
+    log_body = log_body[:max_body_len] + "\n... (以降省略)"
+
+  message = header + log_body + footer
+
+  try:
+    res = requests.post(
+        target_webhook, json={"content": message}, timeout=10
+    )
+    print(
+        f"[{end_time}] ログ専用チャンネルへ運行終了ログを送信完了 ({line_name} /"
+        f" ステータス: {res.status_code})"
+    )
+  except Exception as e:
+    print(f"運行終了ログ送信エラー: {e}")
 
 
 def scan_once():
+  """全路線の1周スキャン"""
+  jst = timezone(timedelta(hours=9))
+  now_str = datetime.now(jst).strftime("%Y/%m/%d %H:%M:%S")
+  current_seen_train_ids = set()
+
   for line_code, line_name in TARGET_LINES.items():
     url = BASE_URL.format(line_code)
     try:
       res = requests.get(url, headers=HEADERS, timeout=10)
       if res.status_code != 200:
+        time.sleep(1)
         continue
       res.encoding = res.apparent_encoding
-    except Exception:
+    except Exception as e:
+      print(f"エラー発生 ({line_name}): {e}")
+      time.sleep(1)
       continue
 
     soup = BeautifulSoup(res.text, "html.parser")
@@ -160,27 +268,62 @@ def scan_once():
       direction = "上り" if "train-info-up" in box.get("class", []) else "下り"
       dest_tag = box.find("div", class_="train-destination-text")
       destination = dest_tag.get_text(strip=True) if dest_tag else ""
-
       img_tag = box.find("img")
       img_src = img_tag.get("src", "") if img_tag else ""
 
       delay_text = parse_delay_text(box)
 
-      # 貸切判定
-      is_kashikiri = (
+      is_target = (
           "09.png" in img_src
           or "貸切" in destination
           or "貸切" in box.get_text()
       )
 
-      if is_kashikiri:
-        location_name, cell_num = resolve_train_location(box, stations)
-        train_key = f"{line_code}_{direction}_{destination}_{cell_num}"
+      if is_target:
+        # directionを渡して矢印の向きを判定
+        location_name, cell_num = resolve_train_location(
+            box, stations, direction
+        )
+        train_id = f"{line_code}_{direction}_{destination}"
+        current_seen_train_ids.add(train_id)
 
+        if train_id not in active_trains:
+          active_trains[train_id] = {
+              "line_name": line_name,
+              "direction": direction,
+              "dest": destination,
+              "history": [],
+              "missed_count": 0,
+          }
+
+        train_data = active_trains[train_id]
+        train_data["missed_count"] = 0
+
+        last_recorded_loc = (
+            train_data["history"][-1]["location"]
+            if train_data["history"]
+            else None
+        )
+        if location_name != last_recorded_loc:
+          train_data["history"].append({
+              "time": now_str,
+              "location": location_name,
+              "delay": delay_text,
+          })
+          save_train_log(
+              line_name,
+              direction,
+              destination,
+              location_name,
+              delay_text,
+              now_str,
+          )
+
+        train_key = f"{train_id}_{cell_num}"
         if train_key not in notified_trains:
           notified_trains.add(train_key)
           print(
-              f"【貸切検知】{line_name} / {direction} / {location_name} /"
+              f"【検知】{line_name} / {direction} / {location_name} /"
               f" {delay_text}"
           )
           send_discord_embed(
@@ -190,14 +333,39 @@ def scan_once():
               location_name,
               delay_text,
               line_code,
+              now_str,
           )
+
+    time.sleep(1)
+
+  # 画面から消えた列車の判定とログ送信
+  finished_train_ids = []
+  for train_id, train_data in active_trains.items():
+    if train_id not in current_seen_train_ids:
+      train_data["missed_count"] += 1
+      if train_data["missed_count"] >= 2:
+        send_finish_log_to_discord(train_data)
+        finished_train_ids.append(train_id)
+
+  for t_id in finished_train_ids:
+    del active_trains[t_id]
+
+  return len(active_trains) > 0
 
 
 if __name__ == "__main__":
+  count = 1
+  print("=== 近鉄 貸切監視システム（速報＆ログチャンネル分離稼働中） ===")
+  while True:
+    print(f"\n[{time.strftime('%H:%M:%S')}] 監視スキャン実施 (#{count})")
+    has_kashikiri = scan_once()
+    count += 1
 
-  # 1分おきに5回チェック（GitHub Actionsで5分バトンタッチ）
-  for i in range(5):
-    print(f"[{time.strftime('%H:%M:%S')}] スキャン実施 ({i+1}/5)")
-    scan_once()
-    if i < 4:
-      time.sleep(60)
+    if has_kashikiri:
+      wait_sec = 60
+      print(f"[{time.strftime('%H:%M:%S')}] 🚨 貸切検知中！1分後に再追跡します。")
+    else:
+      wait_sec = 180
+      print(f"[{time.strftime('%H:%M:%S')}] 貸切なし。3分間待機します。")
+
+    time.sleep(wait_sec)
