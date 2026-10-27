@@ -117,7 +117,6 @@ def resolve_train_location(box, stations_dict, direction="下り"):
     st1 = stations_dict.get(st_idx1, f"駅番号{st_idx1}")
     st2 = stations_dict.get(st_idx2, f"駅番号{st_idx2}")
 
-    # 上り・下りで矢印の向きを切り替え
     if direction == "上り":
       location_name = f"{st2} → {st1} 間"
     else:
@@ -306,7 +305,6 @@ def scan_once():
     )
 
     for box in train_boxes:
-      # 方向判定修正箇所
       direction = "上り" if "train-info-down" in box.get("class", []) else "下り"
       dest_tag = box.find("div", class_="train-destination-text")
       destination = dest_tag.get_text(strip=True) if dest_tag else ""
@@ -338,7 +336,7 @@ def scan_once():
           }
 
         train_data = active_trains[train_id]
-        train_data["missed_count"] = 0
+        train_data["missed_count"] = 0  # 検知中はカウントをリセット
 
         last_recorded_loc = (
             train_data["history"][-1]["location"]
@@ -379,25 +377,51 @@ def scan_once():
 
     time.sleep(1)
 
-  # 終了判定
+  # ─── 終了・転線猶予判定ロジック ───
   finished_train_ids = []
   for train_id, train_data in active_trains.items():
     if train_id not in current_seen_train_ids:
       train_data["missed_count"] += 1
-      if train_data["missed_count"] >= 2:
+      last_loc = (
+          train_data["history"][-1]["location"]
+          if train_data["history"]
+          else "位置不明"
+      )
+
+      if train_data["missed_count"] == 1:
+        # 画面から消えた1回目のスキャン
+        print(
+            f"[{datetime.now(jst).strftime('%H:%M:%S')}] ⚠️"
+            f" 【表示終了】[{train_data['line_name']}] {last_loc}"
+            " で終了。転線確認のため1分おきに残り3回追跡します。(1/3)"
+        )
+      elif train_data["missed_count"] <= 3:
+        # 猶予期間（2〜3回目）
+        print(
+            f"[{datetime.now(jst).strftime('%H:%M:%S')}] 🔍"
+            f" [{train_data['line_name']}]"
+            f" 転線・再出現を確認中... ({train_data['missed_count']}/3)"
+        )
+      else:
+        # 3回見失った後のスキャン（4回目で見つからず完全終了判定）
+        print(
+            f"[{datetime.now(jst).strftime('%H:%M:%S')}] 🏁"
+            f" [{train_data['line_name']}] 運行終了確定（{last_loc}）。Discordへログを送信します。"
+        )
         send_finish_log_to_discord(train_data)
         finished_train_ids.append(train_id)
 
   for t_id in finished_train_ids:
     del active_trains[t_id]
 
+  # 追跡中（見失い猶予中を含む）の列車が残っていれば 1分間隔を維持
   return len(active_trains) > 0
 
 
 if __name__ == "__main__":
   count = 1
   jst = timezone(timedelta(hours=9))
-  print("=== 近鉄 貸切監視システム（安全制御・夜間管理稼働中） ===")
+  print("=== 近鉄 貸切監視システム（転線追跡・猶予制御稼働中） ===")
 
   while True:
     now_dt = datetime.now(jst)
@@ -417,7 +441,7 @@ if __name__ == "__main__":
       wait_sec = 60
       print(
           f"[{datetime.now(jst).strftime('%H:%M:%S')}] 🚨"
-          " 貸切検知中！1分後に再追跡します。"
+          " 貸切検知・追跡中！1分後に再スキャンします。"
       )
     else:
       wait_sec = 180
